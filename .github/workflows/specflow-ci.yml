@@ -1,0 +1,215 @@
+name: SpecFlow Tests CI/CD
+
+on:
+  workflow_dispatch:
+    inputs:
+      swag_labs_username:
+        description: 'Optional: Swag Labs Username (will override repo/env secret if supplied) — NOT secret'
+        required: false
+        type: string
+      swag_labs_password:
+        description: 'Optional: Swag Labs Password (will override repo/env secret if supplied) — NOT secret'
+        required: false
+        type: string
+      environment:
+        description: 'Test Environment label'
+        required: false
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+          - dev
+
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main ]
+
+env:
+  DOTNET_VERSION: '6.0.x'
+  BASE_URL: 'https://www.saucedemo.com/'
+
+jobs:
+  test:
+    environment:
+      name: ${{ github.event.inputs.environment || 'staging' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: ${{ env.DOTNET_VERSION }}
+
+      - name: Add dotnet tools path
+        run: echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: Cache NuGet packages
+        uses: actions/cache@v4
+        with:
+          path: ~/.nuget/packages
+          key: ${{ runner.os }}-nuget-${{ hashFiles('**/*.csproj') }}
+          restore-keys: |
+            ${{ runner.os }}-nuget-
+
+      - name: Restore dependencies
+        run: dotnet restore
+
+      - name: Build project
+        run: dotnet build --no-restore --configuration Release
+
+      - name: Install Playwright CLI (dotnet tool)
+        run: dotnet tool install --global Microsoft.Playwright.CLI || true
+
+      - name: Ensure tools on path
+        run: echo "$HOME/.dotnet/tools" >> $GITHUB_PATH
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ca-certificates \
+            fonts-liberation \
+            fonts-noto-color-emoji \
+            libasound2t64 \
+            libatk-bridge2.0-0 \
+            libatk1.0-0 \
+            libc6 \
+            libcups2t64 \
+            libdrm2 \
+            libgbm1 \
+            libglib2.0-0 \
+            libgtk-3-0t64 \
+            libnspr4 \
+            libnss3 \
+            libx11-xcb1 \
+            libxcomposite1 \
+            libxdamage1 \
+            libxrandr2 \
+            libxkbcommon0 \
+            libxcb1 \
+            libxshmfence1 \
+            libpango-1.0-0 \
+            libpangocairo-1.0-0 \
+            wget \
+            xdg-utils
+
+      - name: Install Playwright browsers (without system deps)
+        run: playwright install chromium
+
+      - name: Set base URL and environment label
+        run: |
+          echo "SWAG_LABS_URL=${{ env.BASE_URL }}" >> $GITHUB_ENV
+          echo "TEST_ENVIRONMENT=${{ github.event.inputs.environment || 'staging' }}" >> $GITHUB_ENV
+
+      - name: Use dispatch inputs for credentials (if provided)
+        if: ${{ github.event_name == 'workflow_dispatch' && github.event.inputs.swag_labs_username != '' && github.event.inputs.swag_labs_password != '' }}
+        env:
+          DISPATCH_USER: ${{ github.event.inputs.swag_labs_username }}
+          DISPATCH_PASS: ${{ github.event.inputs.swag_labs_password }}
+        run: |
+          echo "Using workflow_dispatch inputs for credentials (NOT SECRET)"
+          echo "SWAG_LABS_USERNAME=$DISPATCH_USER" >> $GITHUB_ENV
+          echo "SWAG_LABS_PASSWORD=$DISPATCH_PASS" >> $GITHUB_ENV
+
+      - name: Use repo/environment secrets for credentials (fallback)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && github.event.inputs.swag_labs_username != '' && github.event.inputs.swag_labels_password != '') }}
+        env:
+          SECRET_USER: ${{ secrets.SWAG_LABS_USERNAME }}
+          SECRET_PASS: ${{ secrets.SWAG_LABS_PASSWORD }}
+        run: |
+          echo "Using repository/environment secrets (masked)"
+          echo "SWAG_LABS_USERNAME=$SECRET_USER" >> $GITHUB_ENV
+          echo "SWAG_LABS_PASSWORD=$SECRET_PASS" >> $GITHUB_ENV
+
+      - name: Debug environment and credentials
+        run: |
+          echo "SWAG_LABS_URL=$SWAG_LABS_URL"
+          echo "TEST_ENVIRONMENT=$TEST_ENVIRONMENT"
+          test -n "$SWAG_LABS_USERNAME" && echo "SWAG_LABS_USERNAME is set" || echo "SWAG_LABS_USERNAME is NOT set"
+          if [ -n "$SWAG_LABS_PASSWORD" ]; then echo "SWAG_LABS_PASSWORD set (length: $(echo -n "$SWAG_LABS_PASSWORD" | wc -c))"; else echo "SWAG_LABS_PASSWORD is NOT set"; fi
+
+      - name: Verify test project structure
+        run: |
+          echo "=== Repository Structure ==="
+          ls -la
+          
+          echo "=== Looking for .csproj files ==="
+          find . -name "*.csproj" -type f 2>/dev/null || echo "No .csproj files found"
+          
+          echo "=== Looking for test files ==="
+          find . -name "*.feature" -type f 2>/dev/null || echo "No .feature files found"
+          find . -name "*Steps.cs" -type f 2>/dev/null || echo "No step definition files found"
+          
+          if [ -f "SwagLabsTests.csproj" ]; then
+            echo "✓ SwagLabsTests.csproj found in root"
+            echo "=== Project file contents ==="
+            cat SwagLabsTests.csproj
+          else
+            echo "✗ SwagLabsTests.csproj not found in root directory"
+            echo "Available files:"
+            ls -la
+          fi
+
+      - name: Create TestResults directory
+        run: mkdir -p TestResults
+
+      - name: Run SpecFlow tests
+        run: |
+          echo "Running dotnet test for SwagLabsTests.csproj"
+          echo "Environment: $TEST_ENVIRONMENT"
+          echo "Base URL: $SWAG_LABS_URL"
+          
+          # Check if project file exists before running tests
+          if [ ! -f "SwagLabsTests.csproj" ]; then
+            echo "Error: SwagLabsTests.csproj not found!"
+            exit 1
+          fi
+          
+          # Run the tests with proper output paths
+          dotnet test ./SwagLabsTests.csproj \
+            --no-build \
+            --configuration Release \
+            --logger "trx;LogFileName=TestResults/test-results.trx" \
+            --logger "console;verbosity=detailed" \
+            --results-directory ./TestResults \
+            --verbosity detailed
+
+      - name: Display test results
+        if: always()
+        run: |
+          echo "=== Test Results Directory ==="
+          ls -la TestResults/ || echo "No TestResults directory found"
+          
+          echo "=== Looking for test output files ==="
+          find . -name "*.trx" -type f 2>/dev/null || echo "No .trx files found"
+          find . -name "*.xml" -type f 2>/dev/null || echo "No .xml files found"
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results
+          path: |
+            TestResults/**/*.trx
+            TestResults/**/*.xml
+            **/*.trx
+
+      - name: Upload test artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-artifacts
+          path: |
+            **/traces/**/*.zip
+            **/videos/**/*.webm
+            **/screenshots/**/*.png
+            **/*.html
+            **/bin/Debug/net*/playwright-traces/**
+            **/bin/Release/net*/playwright-traces/**
+          if-no-files-found: ignore
